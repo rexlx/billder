@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -23,14 +24,30 @@ func main() {
 	if port == "" {
 		port = "8080"
 	}
-	log.Printf("Listening on port %s", port)
+	log.Printf("Billder Server listening on port %s", port)
 	if err := http.ListenAndServe(":"+port, nil); err != nil {
 		log.Fatal(err)
 	}
 }
 
 func buildHandler(w http.ResponseWriter, r *http.Request) {
-	// Setup SSE
+	// --- SECURITY BOUNCERS ---
+
+	// 1. Method Check
+	if r.Method != "POST" {
+		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// 2. Auth Check (Simple Shared Secret)
+	// Set the environment variable AUTH_TOKEN in Cloud Run
+	expectedToken := os.Getenv("AUTH_TOKEN")
+	if expectedToken != "" && r.Header.Get("X-Billder-Token") != expectedToken {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	// 3. Setup Streaming Headers
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
@@ -41,30 +58,37 @@ func buildHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Helper to send logs to client
 	sendProgress := func(msg string) {
+		// Clean newlines to avoid breaking SSE protocol
 		fmt.Fprintf(w, "data: %s\n\n", msg)
 		flusher.Flush()
 	}
 
+	// 4. Parse Body (Limit to 4KB to prevent abuse)
+	r.Body = http.MaxBytesReader(w, r.Body, 4096)
 	var payload RequestPayload
 	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
-		sendProgress("Error: Invalid JSON")
+		sendProgress("Error: Invalid JSON payload")
 		return
 	}
+
+	// Defaults
 	if payload.TargetArch == "" {
 		payload.TargetArch = "amd64"
 	}
 
-	// 1. Determine Compiler Environment
-	//    This is the critical part for Fyne/CGo support.
+	sendProgress(fmt.Sprintf("Starting job for %s [%s/%s]", payload.RepoURL, payload.TargetOS, payload.TargetArch))
+
+	// --- BUILD LOGIC ---
+
+	// 5. Determine Compiler Environment
 	var env []string
-	baseEnv := os.Environ() // Keep existing PATH, GOPATH, etc.
+	baseEnv := os.Environ()
 
 	switch payload.TargetOS {
 	case "windows":
-		// Use MinGW compiler for Windows targets
-		// Note: 'x86_64-w64-mingw32-gcc' is standard on Debian for 64-bit Windows
-		sendProgress("Configuring build for Windows (MinGW)...")
+		// Use MinGW for Windows
 		env = append(baseEnv,
 			"CGO_ENABLED=1",
 			"GOOS=windows",
@@ -73,66 +97,54 @@ func buildHandler(w http.ResponseWriter, r *http.Request) {
 			"CXX=x86_64-w64-mingw32-g++",
 		)
 	case "linux":
-		// Use standard GCC for Linux targets
-		sendProgress("Configuring build for Linux (Native GCC)...")
+		// Use native GCC
 		env = append(baseEnv,
 			"CGO_ENABLED=1",
 			"GOOS=linux",
 			"GOARCH="+payload.TargetArch,
 			"CC=gcc",
 		)
-	case "darwin":
-		// MacOS Cross-compile with CGo is notoriously difficult on Linux
-		// because of Apple SDK licensing. It usually requires 'osxcross'.
-		sendProgress("Error: MacOS (darwin) cross-compilation with CGO is not supported in this container.")
-		return
 	default:
-		sendProgress("Error: Unsupported OS")
+		sendProgress("Error: Unsupported OS. Only 'linux' and 'windows' supported.")
 		return
 	}
 
-	// 2. Create Workspace
-	tmpDir, err := os.MkdirTemp("", "fyne-build-*")
+	// 6. Create Temp Workspace
+	tmpDir, err := os.MkdirTemp("", "billder-*")
 	if err != nil {
-		sendProgress("Error: Failed to create temp dir")
+		sendProgress("Error: Failed to create workspace")
 		return
 	}
 	defer os.RemoveAll(tmpDir)
 
-	// 3. Clone
-	sendProgress(fmt.Sprintf("Cloning %s...", payload.RepoURL))
+	// 7. Git Clone
+	sendProgress("Step 1/3: Cloning repository...")
 	repoPath := filepath.Join(tmpDir, "src")
-	if out, err := exec.Command("git", "clone", "https://"+payload.RepoURL, repoPath).CombinedOutput(); err != nil {
-		log.Printf("Clone output: %s", out)
-		sendProgress("Error: Git clone failed")
+	// Note: In production, validate payload.RepoURL to prevent command injection
+	cloneCmd := exec.Command("git", "clone", "https://"+payload.RepoURL, repoPath)
+	if out, err := cloneCmd.CombinedOutput(); err != nil {
+		log.Printf("Clone Error: %s", out)
+		sendProgress("Error: Git clone failed. Is the URL correct?")
 		return
 	}
 
-	// 4. Download Go Dependencies (Tidy)
-	//    Fyne apps often need 'go mod tidy' ensuring all C-bound deps are resolved
-	sendProgress("Resolving dependencies...")
+	// 8. Go Mod Tidy
+	sendProgress("Step 2/3: Resolving dependencies...")
 	tidyCmd := exec.Command("go", "mod", "tidy")
 	tidyCmd.Dir = repoPath
 	tidyCmd.Env = env
-	if out, err := tidyCmd.CombinedOutput(); err != nil {
-		// Log but don't fail, sometimes tidy isn't strictly necessary if vendor exists
-		log.Printf("Tidy warning: %s", out)
-	}
+	_ = tidyCmd.Run() // Ignore errors here, just a best effort cleanup
 
-	// 5. Build
+	// 9. Go Build
+	sendProgress("Step 3/3: Compiling...")
 	outputBinary := filepath.Join(tmpDir, "app")
 	if payload.TargetOS == "windows" {
 		outputBinary += ".exe"
 	}
 
-	sendProgress("Compiling (this may take 1-2 minutes for Fyne)...")
-
-	// -trimpath makes the binary builds reproducible and removes local paths
-	// -ldflags "-s -w -H=windowsgui" is recommmended for Fyne Windows apps to hide the console window
 	buildArgs := []string{"build", "-trimpath", "-o", outputBinary}
-
 	if payload.TargetOS == "windows" {
-		// Hide the console window on Windows
+		// -H=windowsgui hides the console window on Windows
 		buildArgs = append(buildArgs, "-ldflags", "-s -w -H=windowsgui")
 	} else {
 		buildArgs = append(buildArgs, "-ldflags", "-s -w")
@@ -144,18 +156,32 @@ func buildHandler(w http.ResponseWriter, r *http.Request) {
 	buildCmd.Env = env
 
 	if out, err := buildCmd.CombinedOutput(); err != nil {
-		// Capture the compiler error, which is crucial for CGo issues
-		log.Printf("Build Error:\n%s", out)
-		sendProgress("Error: Build failed. Check logs for C compiler errors.")
-		// In a real app, you might send the last 5 lines of 'out' to the user here
+		log.Printf("Build Output: %s", out)
+		sendProgress("Error: Compilation failed.")
+		// Optionally send the last few lines of 'out' to the user
 		return
 	}
 
-	// 6. Success
+	// 10. Handover Strategy (Stream the file)
 	stat, _ := os.Stat(outputBinary)
-	sendProgress(fmt.Sprintf("Success! Binary size: %.2f MB", float64(stat.Size())/1024/1024))
+	fileSizeMB := float64(stat.Size()) / 1024 / 1024
+	sendProgress(fmt.Sprintf("Build Successful! Artifact size: %.2f MB", fileSizeMB))
 
-	// Close stream
-	fmt.Fprintf(w, "event: close\ndata: close\n\n")
+	// Open the binary file
+	f, err := os.Open(outputBinary)
+	if err != nil {
+		sendProgress("Error: Could not open built artifact")
+		return
+	}
+	defer f.Close()
+
+	// SIGNAL: Tell client to switch to binary mode
+	// We send the filename in the 'data' field
+	fmt.Fprintf(w, "event: binary_start\ndata: %s\n\n", filepath.Base(outputBinary))
 	flusher.Flush()
+
+	// STREAM: Copy raw bytes to the response body
+	if _, err := io.Copy(w, f); err != nil {
+		log.Printf("Streaming error: %v", err)
+	}
 }

@@ -1,7 +1,6 @@
 # Dockerfile
 FROM golang:1.23-bookworm
 
-# Install dependencies (Git, MinGW for Windows, X11 for Linux GUI)
 RUN apt-get update && apt-get install -y \
     git \
     pkg-config \
@@ -13,18 +12,15 @@ RUN apt-get update && apt-get install -y \
 
 WORKDIR /app
 
-# Copy module files first for caching
+# Cache dependencies
 COPY go.mod ./
-# COPY go.sum ./
 RUN go mod download
 
-# Copy the entire source tree (cmd, internal, pkg, etc.)
+# Copy source
 COPY . .
 
-# --- CHANGED SECTION ---
-# Build the specific binary located in cmd/billder
-# We output it as 'billder-server' just to be explicit
+# Build the server binary
 RUN go build -o billder-server ./cmd/billder
 
-# Run the binary
+# Run the server
 CMD ["/app/billder-server"]
