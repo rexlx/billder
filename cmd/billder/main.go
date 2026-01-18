@@ -31,7 +31,6 @@ func main() {
 }
 
 func buildHandler(w http.ResponseWriter, r *http.Request) {
-	// --- SECURITY BOUNCERS ---
 
 	// 1. Method Check
 	if r.Method != "POST" {
@@ -72,7 +71,7 @@ func buildHandler(w http.ResponseWriter, r *http.Request) {
 		sendProgress("Error: Invalid JSON payload")
 		return
 	}
-
+	log.Println("Received build request", payload)
 	// Defaults
 	if payload.TargetArch == "" {
 		payload.TargetArch = "amd64"
@@ -127,6 +126,13 @@ func buildHandler(w http.ResponseWriter, r *http.Request) {
 		sendProgress("Error: Git clone failed. Is the URL correct?")
 		return
 	}
+	dirContents, _ := os.ReadDir(repoPath)
+	if len(dirContents) == 0 {
+		sendProgress("Error: Repository is empty.")
+		return
+	}
+
+	log.Println("Repository cloned to", repoPath, dirContents)
 
 	// 8. Go Mod Tidy
 	sendProgress("Step 2/3: Resolving dependencies...")
@@ -154,7 +160,7 @@ func buildHandler(w http.ResponseWriter, r *http.Request) {
 	buildCmd := exec.Command("go", buildArgs...)
 	buildCmd.Dir = repoPath
 	buildCmd.Env = env
-
+	log.Println("Running build command:", buildCmd.Args)
 	if out, err := buildCmd.CombinedOutput(); err != nil {
 		log.Printf("Build Output: %s", out)
 		sendProgress("Error: Compilation failed.")
@@ -165,6 +171,7 @@ func buildHandler(w http.ResponseWriter, r *http.Request) {
 	// 10. Handover Strategy (Stream the file)
 	stat, _ := os.Stat(outputBinary)
 	fileSizeMB := float64(stat.Size()) / 1024 / 1024
+	log.Printf("Binary built successfully: %s (%.2f MB)", outputBinary, fileSizeMB)
 	sendProgress(fmt.Sprintf("Build Successful! Artifact size: %.2f MB", fileSizeMB))
 
 	// Open the binary file
